@@ -1,0 +1,73 @@
+// Grok-style trading bot in hola-cc: continuous monitor + signals.
+// Mirrors xAI function-calling setup: brain decides, tools execute locally.
+// Build: make
+// Run: ./grok_trader symbol=BTC-USD checks=10 interval_seconds=60 alert_percent=0.5 max_risk_pct=1.0 min_confidence=70.0
+
+// Market data + sentiment + risk-checked signals.
+skill trading {
+    instructions `You are a crypto trading brain like Grok with function calling.
+Think out loud: narrate EVERY step with the narrate tool before and after each calculation.
+Rules: never invent prices, always call get_price first.
+Wait between checks with wait. Log every check with log_trade.
+Emit a signal with emit_signal on every check that matters: BUY, SELL, or HOLD.
+Only signal BUY/SELL when confidence >= min_confidence and the move since last
+check >= alert_percent. Otherwise emit HOLD. Never risk more than max_risk_pct
+per trade. Output the final summary via submit_result.
+How to calculate, and always say it:
+1. PRICE: call get_price, then narrate the raw JSON and the parsed amount.
+2. MOVE: pct = (current - previous) / previous * 100. Narrate both prices and the math.
+3. FIRST-CHECK: pct vs first price too; narrate both comparisons.
+4. CONFIDENCE 0-100: start 50, +20 if move >= 2x alert_percent, +10 if same direction twice in a row, -20 if move < alert_percent, -15 if price whipsaws (direction flipped). Narrate each adjustment.
+5. DECISION: BUY if up-move >= alert_percent and confidence >= min_confidence. SELL if down-move >= alert_percent and confidence >= min_confidence. Else HOLD. Narrate the rule that fired.
+6. SIZE: qty sized so loss at 2 pct adverse move <= max_risk_pct of equity; narrate the sizing math. Paper only.`
+
+    // Says one verbose reasoning line to the user (calculation trace, dim cyan).
+    tool narrate(step string) = print "  ▸ {{step}}"
+
+    // Live spot price from Coinbase, as JSON ({"data":{"amount":"..."}}).
+    tool get_price(symbol string) = http "https://api.coinbase.com/v2/prices/{{symbol}}/spot"
+
+    // Waits the given number of seconds, then returns the time.
+    tool wait(seconds int) = sh "sleep {{seconds}} && date +%H:%M:%S"
+
+    // Emits one trading signal on screen (print = visible; sh output only goes to the model).
+    // Plain banner formatting: sh-based ANSI colors never reach the terminal, so use print.
+    tool emit_signal(side string, message string) = print "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n SIGNAL {{side}}: {{message}}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    // Records the signal to SIGNALS.log (file only, no screen output).
+    tool record_signal(side string, message string) = sh "echo [{{side}}] {{message}} >> SIGNALS.log && echo recorded"
+
+    // Risk-checked paper order: logs intent, never touches real money.
+    // Real execution must be wired by the operator behind this command.
+    tool place_order(symbol string, side string, qty string) = sh "echo PAPER_ORDER symbol={{symbol}} side={{side}} qty={{qty}}"
+
+    // Trade journal: append one line.
+    tool log_trade(text string) = sh "echo {{text}} >> TRADE_LOG.md && echo logged"
+}
+
+// Watches one symbol continuously and emits BUY/SELL/HOLD signals.
+agent GrokTrader {
+    persona "You are a calm crypto trading assistant. You manage risk first and never give guaranteed returns."
+    goal "Check price for `symbol` exactly `checks` times, `interval_seconds` apart. Each check: call get_price, NARRATE the raw price and parsed amount, compute and NARRATE the pct move vs previous and vs first, NARRATE each confidence adjustment, NARRATE the rule that fired, decide BUY/SELL/HOLD, emit the signal on screen with emit_signal AND save it with record_signal, log with log_trade. Then report the session."
+    skills [trading]
+    tools ["fs"]
+    max_turns 200
+    input {
+        symbol string "trading pair, e.g. BTC-USD"
+        checks int "how many price checks to make"
+        interval_seconds int "seconds between checks"
+        alert_percent float "the move, in percent, that deserves a BUY/SELL signal"
+        max_risk_pct float "max risk percent per trade"
+        min_confidence float "minimum confidence to signal BUY/SELL, else HOLD"
+    }
+    output {
+        first float "price at the first check, USD"
+        last float "price at the last check, USD"
+        low float "lowest price seen"
+        high float "highest price seen"
+        signals int "how many BUY/SELL signals were emitted"
+        checks_done int "how many checks completed"
+        summary string "one or two sentences on how the price moved and what was signaled"
+    }
+    task "Monitor {{symbol}}: {{checks}} checks, {{interval_seconds}} seconds apart, signal at {{alert_percent}} pct. Max risk {{max_risk_pct}} pct. Signal BUY/SELL only if confidence >= {{min_confidence}}, else HOLD. Every round: get_price, then NARRATE raw JSON + parsed price + pct math vs prev and vs first + each confidence adjustment + rule fired, then emit signal on screen with emit_signal AND save it with record_signal, log check, wait."
+}
