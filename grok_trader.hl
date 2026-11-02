@@ -3,7 +3,7 @@
 // Build: make
 // Run: ./grok_trader symbol=BTC-USD checks=10 interval_seconds=60 alert_percent=0.5 max_risk_pct=1.0 min_confidence=70.0
 
-// Market data + sentiment + risk-checked signals.
+// Market data + trend + sentiment + risk-checked signals.
 skill trading {
     instructions `You are a crypto trading brain like Grok with function calling.
 Think out loud: narrate EVERY step with the narrate tool before and after each calculation.
@@ -15,17 +15,47 @@ check >= alert_percent. Otherwise emit HOLD. Never risk more than max_risk_pct
 per trade. Output the final summary via submit_result.
 How to calculate, and always say it:
 1. PRICE: call get_price, then narrate the raw JSON and the parsed amount.
-2. MOVE: pct = (current - previous) / previous * 100. Narrate both prices and the math.
-3. FIRST-CHECK: pct vs first price too; narrate both comparisons.
-4. CONFIDENCE 0-100: start 50, +20 if move >= 2x alert_percent, +10 if same direction twice in a row, -20 if move < alert_percent, -15 if price whipsaws (direction flipped). Narrate each adjustment.
-5. DECISION: BUY if up-move >= alert_percent and confidence >= min_confidence. SELL if down-move >= alert_percent and confidence >= min_confidence. Else HOLD. Narrate the rule that fired.
-6. SIZE: qty sized so loss at 2 pct adverse move <= max_risk_pct of equity; narrate the sizing math. Paper only.`
+2. TREND: call get_candles for the last 20x 5-min candles. Each candle is
+[time, low, high, open, close, volume]. Take the close (index 4) of each.
+SMA10 = average of the last 10 closes. Narrate the closes and the SMA math.
+Trend is UP if current price > SMA10, DOWN if below, FLAT if within 0.05 pct.
+3. MOMENTUM: count consecutive rising closes at the end of the candle list
+(up_streak) and consecutive falling closes (down_streak). Narrate the streak.
+Also compute RANGE_PCT = (highest close - lowest close) / lowest close * 100
+over the 20 candles and narrate it: this is recent volatility.
+4. SENTIMENT: call get_sentiment (Fear and Greed 0-100). Narrate value + label.
+Extreme Fear (<=25) is contrarian-bullish, Extreme Greed (>=75) is caution-bearish.
+5. MOVE: pct = (current - previous) / previous * 100. Narrate both prices and the math.
+FIRST-CHECK: pct vs first price too; narrate both comparisons.
+6. EFFECTIVE THRESHOLD (fixes flat HOLDs): base = alert_percent.
+If trend aligns with the move direction (UP+up-move or DOWN+down-move),
+effective = base / 2. If additionally streak >= 3 in the same direction,
+effective = base / 3. Narrate base vs effective and why it changed.
+Flat chop (RANGE_PCT < base / 2) forces HOLD no matter what: narrate that.
+7. CONFIDENCE 0-100: start 50.
++15 if trend aligns with move direction; -10 if it opposes.
++10 if streak >= 2 same direction; +5 more if streak >= 3.
++10 if sentiment confirms (Fear<=25 on up-move, Greed>=75 on down-move,
+or 40-60 neutral always +5 for low noise).
+-20 if move < effective threshold; -15 if price whipsaws (direction flipped).
+Clamp 0-100. Narrate each adjustment.
+8. DECISION: BUY if up-move >= effective threshold and confidence >= min_confidence.
+SELL if down-move >= effective threshold and confidence >= min_confidence.
+Else HOLD. Narrate trend + streak + sentiment + the rule that fired.
+9. SIZE: qty sized so loss at 2 pct adverse move <= max_risk_pct of equity;
+scale qty by confidence/100 (low confidence = smaller size). Narrate the sizing math. Paper only.`
 
     // Says one verbose reasoning line to the user (calculation trace, dim cyan).
     tool narrate(step string) = print "  ▸ {{step}}"
 
     // Live spot price from Coinbase, as JSON ({"data":{"amount":"..."}}).
     tool get_price(symbol string) = http "https://api.coinbase.com/v2/prices/{{symbol}}/spot"
+
+    // Last 20x 5-min candles: [time, low, high, open, close, volume]. Trend + momentum source.
+    tool get_candles(symbol string) = http "https://api.exchange.coinbase.com/products/{{symbol}}/candles?granularity=300&limit=20"
+
+    // Crypto Fear and Greed index 0-100 with label (contrarian sentiment input).
+    tool get_sentiment() = http "https://api.alternative.me/fng/?limit=1"
 
     // Waits the given number of seconds, then returns the time.
     tool wait(seconds int) = sh "sleep {{seconds}} && date +%H:%M:%S"
@@ -48,7 +78,7 @@ How to calculate, and always say it:
 // Watches one symbol continuously and emits BUY/SELL/HOLD signals.
 agent GrokTrader {
     persona "You are a calm crypto trading assistant. You manage risk first and never give guaranteed returns."
-    goal "Check price for `symbol` exactly `checks` times, `interval_seconds` apart. Each check: call get_price, NARRATE the raw price and parsed amount, compute and NARRATE the pct move vs previous and vs first, NARRATE each confidence adjustment, NARRATE the rule that fired, decide BUY/SELL/HOLD, emit the signal on screen with emit_signal AND save it with record_signal, log with log_trade. Then report the session."
+    goal "Check price for `symbol` exactly `checks` times, `interval_seconds` apart. Each check: call get_price AND get_candles AND get_sentiment, NARRATE price + SMA10 trend + streak/range + sentiment + pct math vs prev and vs first + effective threshold + each confidence adjustment + rule fired, decide BUY/SELL/HOLD, emit the signal on screen with emit_signal AND save it with record_signal, log with log_trade. Then report the session."
     skills [trading]
     tools ["fs"]
     max_turns 200
@@ -69,5 +99,5 @@ agent GrokTrader {
         checks_done int "how many checks completed"
         summary string "one or two sentences on how the price moved and what was signaled"
     }
-    task "Monitor {{symbol}}: {{checks}} checks, {{interval_seconds}} seconds apart, signal at {{alert_percent}} pct. Max risk {{max_risk_pct}} pct. Signal BUY/SELL only if confidence >= {{min_confidence}}, else HOLD. Every round: get_price, then NARRATE raw JSON + parsed price + pct math vs prev and vs first + each confidence adjustment + rule fired, then emit signal on screen with emit_signal AND save it with record_signal, log check, wait."
+    task "Monitor {{symbol}}: {{checks}} checks, {{interval_seconds}} seconds apart, signal at {{alert_percent}} pct. Max risk {{max_risk_pct}} pct. Signal BUY/SELL only if confidence >= {{min_confidence}}, else HOLD. Every round: get_price + get_candles + get_sentiment, then NARRATE raw price + SMA10 trend + streak/range + sentiment + pct math vs prev and vs first + effective threshold + each confidence adjustment + rule fired, then emit signal on screen with emit_signal AND save it with record_signal, log check, wait."
 }
